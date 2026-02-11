@@ -265,7 +265,7 @@ def inserir_evento(cursor, event_name: str, pix_id: str, headers_json: dict, jso
     cursor.execute(
         f"""
         INSERT INTO {TBL_EVENTOS}
-          (event_name, pix_id, headers_json, json_completo, received_at)
+          (event_name, pix_id, headers_json, json_completo, recebido_em)
         VALUES
           (%s, %s, %s, %s, %s)
         """,
