@@ -19,7 +19,7 @@ DB_NAME = os.getenv("DB_NAME", "develop_1_lic")
 
 TECNOSPEED_BASE = os.getenv("TECNOSPEED_BASE", "https://pix.tecnospeed.com.br")
 
-# EXATAMENTE o que você cadastrou no webhook da TecnoSpeed
+# EXATAMENTE o header que você cadastrou no webhook da TecnoSpeed
 WEBHOOK_AUTH = os.getenv("WEBHOOK_AUTH", "Basic dev854850")
 
 # Tabelas (nomes fixos)
@@ -46,7 +46,6 @@ def db_conn():
 
 
 def now_str():
-    # OK para auditoria
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -75,10 +74,6 @@ def parse_iso_dt(s: str):
 # Vínculo (pix_cobrancas_geradas)
 # =========================
 def buscar_vinculo_por_pix(cursor, pix_id: str) -> dict:
-    """
-    Busca vínculo do pix_id na tabela pix_cobrancas_geradas.
-    (SEM tecnospeed_account_id aqui, porque não existe nessa tabela.)
-    """
     cursor.execute(
         f"""
         SELECT
@@ -92,20 +87,13 @@ def buscar_vinculo_por_pix(cursor, pix_id: str) -> dict:
         (pix_id,),
     )
     row = cursor.fetchone()
-    return row or {
-        "id_cobrancas": None,
-        "codigoparasistema": None,
-        "codcadastro": None,
-    }
+    return row or {"id_cobrancas": None, "codigoparasistema": None, "codcadastro": None}
 
 
 # =========================
 # dadospix -> token_company
 # =========================
 def buscar_dadospix(cursor, codigoparasistema, codcadastro) -> dict:
-    """
-    Pega o registro mais recente compatível com (codigoparasistema, codcadastro).
-    """
     cursor.execute(
         f"""
         SELECT
@@ -129,14 +117,13 @@ def buscar_dadospix(cursor, codigoparasistema, codcadastro) -> dict:
 
 def token_expirado(expires_at) -> bool:
     """
-    Considera expirado se faltam <120s
+    Considera expirado se faltam < 120s
     """
     if not expires_at:
         return True
     try:
         dt = expires_at
         if isinstance(dt, str):
-            # MySQL pode devolver string
             dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -149,13 +136,19 @@ def token_expirado(expires_at) -> bool:
 def renovar_token_company(client_id: str, client_secret: str) -> dict:
     """
     POST /oauth2/token
-    Authorization: Basic base64(client_id:client_secret)
-    Body: grant_type=client_credentials
+    Headers:
+      Authorization: Basic base64(client_id:client_secret)
+      Content-Type: application/x-www-form-urlencoded
+
+    Body (OBRIGATÓRIO para TecnoSpeed):
+      grant_type=client_credentials
+      role=company
     """
     if not client_id or not client_secret:
         raise RuntimeError("client_id/client_secret ausentes no dadospix")
 
     url = f"{TECNOSPEED_BASE}/oauth2/token"
+
     raw = f"{client_id}:{client_secret}".encode("utf-8")
     b64 = base64.b64encode(raw).decode("utf-8")
 
@@ -164,7 +157,12 @@ def renovar_token_company(client_id: str, client_secret: str) -> dict:
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
-    data = {"grant_type": "client_credentials"}
+
+    # ✅ FIX: TecnoSpeed exige role
+    data = {
+        "grant_type": "client_credentials",
+        "role": "company",
+    }
 
     r = requests.post(url, headers=headers, data=data, timeout=20)
     if r.status_code not in (200, 201):
@@ -187,9 +185,6 @@ def renovar_token_company(client_id: str, client_secret: str) -> dict:
 
 
 def garantir_token_company(cursor, codigoparasistema, codcadastro) -> str:
-    """
-    Retorna token_company válido. Se expirado, renova e atualiza dadospix.
-    """
     dp = buscar_dadospix(cursor, codigoparasistema, codcadastro)
     if not dp:
         raise RuntimeError("Não encontrei registro em dadospix para esse vínculo.")
@@ -358,11 +353,6 @@ def home():
 
 @app.post("/webhook/pix-pago")
 def webhook_pix():
-    """
-    Recebe eventos da TecnoSpeed:
-    - sempre salva em pix_webhook_eventos
-    - se evento indicar pagamento (PIX_SUCCESSFUL / PIX_PAID), consulta pix/query e salva em pix_recebidos
-    """
     try:
         auth = request.headers.get("Authorization", "")
         if WEBHOOK_AUTH and auth != WEBHOOK_AUTH:
@@ -380,15 +370,14 @@ def webhook_pix():
         conn = db_conn()
         try:
             with conn.cursor() as cursor:
-                # 1) salva SEMPRE o evento
+                # 1) salva SEMPRE
                 inserir_evento(cursor, event_name, pix_id, headers_dict, payload)
 
-                # 2) se for pagamento confirmado, tenta consultar e inserir detalhes
+                # 2) pagamento confirmado -> consulta e salva completo
                 ev = event_name.upper()
                 if ev in ("PIX_SUCCESSFUL", "PIX_PAID"):
                     vinculo = buscar_vinculo_por_pix(cursor, pix_id)
 
-                    # se não achou vínculo, não quebra (fica só na auditoria)
                     if not vinculo.get("id_cobrancas"):
                         print(f"[WARN] PIX pago sem vínculo em pix_cobrancas_geradas. pix_id={pix_id}")
                         conn.commit()
@@ -423,11 +412,6 @@ def webhook_pix():
 
 @app.get("/ui")
 def ui():
-    """
-    UI simples:
-      /ui?pix_id=...  -> mostra eventos e recebido daquele pix_id
-      /ui             -> últimos eventos e últimos recebidos
-    """
     pix_id = request.args.get("pix_id", "").strip()
 
     conn = db_conn()
@@ -469,9 +453,6 @@ def ui():
 
             <h3>Recebidos (pix_recebidos)</h3>
             <pre style="background:#f6f6f6;padding:10px;border-radius:8px;overflow:auto;max-height:360px;">{json.dumps(recebidos, ensure_ascii=False, indent=2)}</pre>
-
-            <p><b>Regras:</b> PIX_SUCCESSFUL/PIX_PAID -> consulta pix/query e grava em pix_recebidos.</p>
-            <p><b>Se não gravar:</b> veja se existe vínculo em pix_cobrancas_geradas para o pix_id, e se dadospix tem client_id/secret válidos.</p>
           </body>
         </html>
         """
