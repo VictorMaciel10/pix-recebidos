@@ -71,9 +71,6 @@ def parse_iso_dt(s: str):
 # Vinculo: pix_cobrancas_geradas
 # =========================
 def buscar_vinculo_por_pix(cursor, pix_id: str) -> dict:
-    """
-    Ajustado para o seu schema real: id_cobrancas, codigoparasistema, codcadastro
-    """
     cursor.execute(
         f"""
         SELECT
@@ -116,14 +113,10 @@ def buscar_dadospix(cursor, codigoparasistema, codcadastro) -> dict:
 
 
 def token_expirado(expires_at) -> bool:
-    """
-    considera expirado se faltar < 120s
-    """
     if not expires_at:
         return True
     try:
         if isinstance(expires_at, str):
-            # MySQL DATETIME -> "YYYY-MM-DD HH:MM:SS"
             dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         else:
             dt = expires_at
@@ -155,7 +148,7 @@ def renovar_token_company(client_id: str, client_secret: str) -> dict:
 
     data = {
         "grant_type": "client_credentials",
-        "role": "company",   # <<< AQUI o ajuste que faltava (evita 422)
+        "role": "company",
     }
 
     r = requests.post(url, headers=headers, data=data, timeout=25)
@@ -211,14 +204,14 @@ def garantir_token_company(cursor, codigoparasistema, codcadastro) -> str:
 # =========================
 def tecnospeed_consultar_pix(pix_id: str, token_company: str) -> dict:
     """
-    A API pode exigir date/range. Vamos:
-    1) tentar por id direto
-    2) se der 400 pedindo date/range -> tenta range últimos 30 dias + id
+    GET /api/v1/pix/query
+    Algumas contas exigem date/range, então:
+    1) tenta só com id
+    2) se der 400 pedindo date/range -> tenta últimos 30 dias com id
     """
     url = f"{TECNOSPEED_BASE}/api/v1/pix/query"
     headers = {"Authorization": f"Bearer {token_company}", "Accept": "application/json"}
 
-    # tentativa 1: só id
     r1 = requests.get(url, headers=headers, params={"id": pix_id}, timeout=25)
     if r1.status_code == 200:
         data = r1.json()
@@ -228,7 +221,6 @@ def tecnospeed_consultar_pix(pix_id: str, token_company: str) -> dict:
             return data["results"][0] if data["results"] else {}
         return {}
 
-    # fallback: se reclamar de date/range
     msg = (r1.text or "")
     if r1.status_code == 400 and ("Date or range of dates" in msg or "betweenDateStart" in msg or "date" in msg):
         end = datetime.now().date()
@@ -237,7 +229,7 @@ def tecnospeed_consultar_pix(pix_id: str, token_company: str) -> dict:
         params = {
             "betweenDateStart": start.strftime("%Y-%m-%d"),
             "betweenDateEnd": end.strftime("%Y-%m-%d"),
-            "queryType": "PAYMENT",   # geralmente o que faz sentido ao confirmar pagamento
+            "queryType": "PAYMENT",
             "id": pix_id,
             "limit": 1,
         }
@@ -252,7 +244,6 @@ def tecnospeed_consultar_pix(pix_id: str, token_company: str) -> dict:
             return data["results"][0] if data["results"] else {}
         return {}
 
-    # qualquer outro erro
     raise RuntimeError(f"Consulta PIX falhou ({r1.status_code}): {r1.text}")
 
 
@@ -279,8 +270,7 @@ def inserir_evento(cursor, event_name: str, pix_id: str, headers_json: dict, jso
 
 def upsert_pix_recebido_minimo(cursor, pix_id: str, event_name: str, vinculo: dict, payload: dict):
     """
-    Se não conseguir consultar a TecnoSpeed no momento, grava pelo menos o pix_id + status.
-    Depois, quando consultar, ele atualiza.
+    Garante que quando chegar PIX_SUCCESSFUL/PIX_PAID, exista ao menos uma linha em pix_recebidos.
     """
     cursor.execute(f"SELECT id_recebido FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1", (pix_id,))
     exists = cursor.fetchone()
@@ -317,6 +307,10 @@ def upsert_pix_recebido_minimo(cursor, pix_id: str, event_name: str, vinculo: di
 
 
 def upsert_pix_recebido_completo(cursor, pix: dict, vinculo: dict):
+    """
+    >>> AQUI foi o ajuste:
+    usa created_at_api (não created_at)
+    """
     pix_id = str(pix.get("id") or "")
     surrogate = str(pix.get("surrogateKey") or "")
     status = str(pix.get("status") or "")
@@ -325,7 +319,7 @@ def upsert_pix_recebido_completo(cursor, pix: dict, vinculo: dict):
     payer_doc = str(pix.get("payerCpfCnpj") or "")
     payer_name = str(pix.get("payerName") or "")
     emv = str(pix.get("emv") or "")
-    created_at = parse_iso_dt(pix.get("createdAt"))
+    created_at_api = parse_iso_dt(pix.get("createdAt"))
 
     codigoparasistema = vinculo.get("codigoparasistema")
     codcadastro = vinculo.get("codcadastro")
@@ -346,7 +340,7 @@ def upsert_pix_recebido_completo(cursor, pix: dict, vinculo: dict):
               payer_cpf_cnpj=%s,
               payer_name=%s,
               emv=%s,
-              created_at=%s,
+              created_at_api=%s,
               recebido_em=%s,
               json_completo=%s,
               codigoparasistema=COALESCE(%s, codigoparasistema),
@@ -356,7 +350,7 @@ def upsert_pix_recebido_completo(cursor, pix: dict, vinculo: dict):
             """,
             (
                 surrogate, status, amount, payment_date,
-                payer_doc, payer_name, emv, created_at,
+                payer_doc, payer_name, emv, created_at_api,
                 now_str(), safe_json(pix),
                 codigoparasistema, codcadastro, id_cobrancas,
                 pix_id,
@@ -366,14 +360,14 @@ def upsert_pix_recebido_completo(cursor, pix: dict, vinculo: dict):
         cursor.execute(
             f"""
             INSERT INTO {TBL_RECEBIDOS}
-              (pix_id, surrogate_key, status, amount, payment_date, payer_cpf_cnpj, payer_name, emv, created_at,
+              (pix_id, surrogate_key, status, amount, payment_date, payer_cpf_cnpj, payer_name, emv, created_at_api,
                recebido_em, json_completo, codigoparasistema, codcadastro, id_cobrancas, pago)
             VALUES
               (%s,%s,%s,%s,%s,%s,%s,%s,%s,
                %s,%s,%s,%s,%s,0)
             """,
             (
-                pix_id, surrogate, status, amount, payment_date, payer_doc, payer_name, emv, created_at,
+                pix_id, surrogate, status, amount, payment_date, payer_doc, payer_name, emv, created_at_api,
                 now_str(), safe_json(pix), codigoparasistema, codcadastro, id_cobrancas
             ),
         )
@@ -389,11 +383,6 @@ def home():
 
 @app.post("/webhook/pix-pago")
 def webhook_pix():
-    """
-    Recebe QUALQUER evento TecnoSpeed.
-    - sempre salva em pix_webhook_eventos
-    - se evento for "pago", tenta consultar detalhes e salvar em pix_recebidos
-    """
     try:
         auth = request.headers.get("Authorization", "")
         if WEBHOOK_AUTH and auth != WEBHOOK_AUTH:
@@ -418,10 +407,10 @@ def webhook_pix():
                 if ev in ("PIX_SUCCESSFUL", "PIX_PAID"):
                     vinculo = buscar_vinculo_por_pix(cursor, pix_id)
 
-                    # garante que pelo menos o "pago" fique rastreável em pix_recebidos
+                    # garante a linha mínima (pra você nunca “perder” um pago)
                     upsert_pix_recebido_minimo(cursor, pix_id, ev, vinculo, payload)
 
-                    # tenta consultar o PIX completo
+                    # tenta consultar completo
                     try:
                         token_company = garantir_token_company(
                             cursor,
@@ -432,7 +421,6 @@ def webhook_pix():
                         if pix_full:
                             upsert_pix_recebido_completo(cursor, pix_full, vinculo)
                     except Exception as e:
-                        # não derruba, só loga
                         print(f"[WARN] Falha ao consultar PIX completo (pix_id={pix_id}): {repr(e)}")
 
                 conn.commit()
@@ -451,11 +439,6 @@ def webhook_pix():
 
 @app.get("/ui")
 def ui():
-    """
-    UI simples:
-    - /ui            -> últimos eventos + últimos recebidos
-    - /ui?pix_id=... -> filtra por pix_id
-    """
     pix_id = request.args.get("pix_id", "").strip()
 
     conn = db_conn()
@@ -498,10 +481,6 @@ def ui():
 
             <h3>Recebidos (pix_recebidos)</h3>
             <pre style="background:#f6f6f6;padding:10px;border-radius:8px;overflow:auto;max-height:360px;">{json.dumps(recebidos, ensure_ascii=False, indent=2)}</pre>
-
-            <p><b>Obs:</b> Se vier PIX_SUCCESSFUL e não vier completo (payerName/amount/etc),
-            você ainda vai ter a linha mínima em pix_recebidos. Depois, quando o token estiver ok e a consulta bater,
-            ela atualiza com os dados completos.</p>
           </body>
         </html>
         """
