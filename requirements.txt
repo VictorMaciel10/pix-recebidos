@@ -1,4 +1,4 @@
-flask
-pymysql
-python-dateutil
-gunicorn
+Flask==3.0.3
+pymysql==1.1.1
+requests==2.32.3
+gunicorn==22.0.0
