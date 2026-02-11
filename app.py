@@ -1,279 +1,354 @@
 import os
 import json
 import pymysql
-from flask import Flask, request, jsonify
-from datetime import datetime, timezone
+import requests
+from datetime import datetime
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
-# ==========================
-# CONFIG
-# ==========================
+# =========================
+# ENV (Railway Variables)
+# =========================
+DB_HOST = os.getenv("DB_HOST", "")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_NAME = os.getenv("DB_NAME", "develop_1_lic")
+
+# Token TecnoSpeed (Company)
+TECNOSPEED_BASE = os.getenv("TECNOSPEED_BASE", "https://pix.tecnospeed.com.br")
+TECNOSPEED_TOKEN = os.getenv("TECNOSPEED_TOKEN", "")  # Bearer token (access_token)
+
+# Webhook auth (o mesmo que você cadastrou na TecnoSpeed)
 WEBHOOK_AUTH = os.getenv("WEBHOOK_AUTH", "Basic dev854850")
 
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "bddevelop1.mysql.database.azure.com"),
-    "user": os.getenv("DB_USER", "bddevelop"),
-    "password": os.getenv("DB_PASS", "E130581.rik"),
-    "database": os.getenv("DB_NAME", "develop_1_lic"),
-    "port": int(os.getenv("DB_PORT", "3306")),
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor,
-    "autocommit": False,
-}
+# Tabelas
+TBL_EVENTOS = f"{DB_NAME}.pix_webhook_eventos"
+TBL_RECEBIDOS = f"{DB_NAME}.pix_recebidos"
+TBL_COBRANCAS = f"{DB_NAME}.pix_cobrancas_geradas"
 
-def conectar_banco():
-    return pymysql.connect(**DB_CONFIG)
 
-def parse_iso_to_mysql_dt(iso_str):
-    """
-    Converte ISO 8601 (ex: 2021-08-25T00:19:23.248Z) para 'YYYY-MM-DD HH:MM:SS' (UTC).
-    Retorna None se inválido.
-    """
-    if not iso_str:
-        return None
+def db_conn():
+    return pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        port=DB_PORT,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+
+
+def now_utc_str():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_json(obj):
     try:
-        s = str(iso_str).strip()
-        # trata Z
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        # garante timezone
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        # mantém UTC no banco
-        dt_utc = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+        return json.dumps(obj, ensure_ascii=False)
     except Exception:
-        return None
+        return "{}"
 
-def pick_event_name(payload: dict):
-    # a TecnoSpeed pode mandar o evento em campos diferentes dependendo do produto.
-    # vamos tentar cobrir os mais comuns:
-    for k in ["event", "tipoWH", "type", "eventName", "onEvent"]:
-        v = payload.get(k)
-        if v:
-            return str(v)
-    return None
 
-def normalize_payment_obj(payload):
+def tecnospeed_consultar_pix(pix_id: str) -> dict:
     """
-    A TecnoSpeed pode mandar:
-    - um array de objetos
-    - um objeto direto
-    - um wrapper { data: {...} } etc
-    Aqui retornamos 1 objeto "principal" de pagamento quando existir.
+    Consulta PIX por id e retorna o primeiro item (dict) se existir.
+    Doc: /api/v1/pix/query
     """
-    if payload is None:
-        return None
+    if not TECNOSPEED_TOKEN:
+        raise RuntimeError("TECNOSPEED_TOKEN não configurado nas variáveis de ambiente.")
 
-    # se vier lista
-    if isinstance(payload, list) and len(payload) > 0 and isinstance(payload[0], dict):
-        return payload[0]
+    url = f"{TECNOSPEED_BASE}/api/v1/pix/query"
+    headers = {"Authorization": f"Bearer {TECNOSPEED_TOKEN}"}
+    params = {"id": pix_id}
 
-    # se vier objeto
-    if isinstance(payload, dict):
-        # alguns wrappers comuns
-        for key in ["data", "pix", "payment", "payload"]:
-            if isinstance(payload.get(key), dict):
-                return payload[key]
-        return payload
+    r = requests.get(url, headers=headers, params=params, timeout=20)
 
-    return None
+    # Ex.: 200 com lista
+    if r.status_code != 200:
+        raise RuntimeError(f"Consulta PIX falhou ({r.status_code}): {r.text}")
 
-def is_paid_event(event_name, status):
-    e = (event_name or "").upper().strip()
-    s = (status or "").upper().strip()
-    # o que você quer considerar como pagamento confirmado:
-    # - evento PIX_PAID
-    # - status PAID (caso venha em outros eventos)
-    return (e == "PIX_PAID") or (s == "PAID")
+    data = r.json()
 
-def fetch_cobranca_vinculo(cursor, pix_id):
+    # a API pode retornar lista direto ou objeto com results
+    if isinstance(data, list):
+        return data[0] if data else {}
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return data["results"][0] if data["results"] else {}
+
+    # fallback
+    return {}
+
+
+def buscar_vinculo_cobranca(cursor, pix_id: str) -> dict:
     """
-    Busca vínculo com a cobrança gerada no seu sistema (pix_cobrancas_geradas).
+    Encontra id_cobrancas, codigoparasistema, codcadastro em pix_cobrancas_geradas pelo pix_id.
     """
-    if not pix_id:
-        return None
-
-    cursor.execute("""
+    cursor.execute(
+        f"""
         SELECT
           id_cobrancas,
           codigoparasistema,
           codcadastro
-        FROM develop_1_lic.pix_cobrancas_geradas
+        FROM {TBL_COBRANCAS}
         WHERE pix_id = %s
-        ORDER BY id_cobrancas DESC
         LIMIT 1
-    """, (str(pix_id),))
-    return cursor.fetchone()
+        """,
+        (pix_id,),
+    )
+    row = cursor.fetchone()
+    return row or {"id_cobrancas": None, "codigoparasistema": None, "codcadastro": None}
 
-def insert_log_event(cursor, event_name, obj, headers_json, json_completo, ip_origem):
-    pix_id = obj.get("id")
-    surrogate_key = obj.get("surrogateKey") or obj.get("surrogate_key")
-    status = obj.get("status")
-    amount = obj.get("amount")
-    payer_cpf_cnpj = obj.get("payerCpfCnpj")
-    payer_name = obj.get("payerName")
-    emv = obj.get("emv")
 
-    payment_date = parse_iso_to_mysql_dt(obj.get("paymentDate"))
-    created_at_api = parse_iso_to_mysql_dt(obj.get("createdAt"))
-
-    cursor.execute("""
-        INSERT INTO develop_1_lic.pix_webhook_eventos
-        (
-          event_name, pix_id, surrogate_key, status, amount,
-          payment_date, payer_cpf_cnpj, payer_name, emv, created_at_api,
-          ip_origem, headers_json, json_completo
-        )
-        VALUES
-        (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CAST(%s AS JSON),%s)
-    """, (
-        event_name,
-        pix_id,
-        surrogate_key,
-        status,
-        amount,
-        payment_date,
-        payer_cpf_cnpj,
-        payer_name,
-        emv,
-        created_at_api,
-        ip_origem,
-        json.dumps(headers_json, ensure_ascii=False),
-        json_completo
-    ))
-
-def upsert_pix_recebido_paid(cursor, obj, json_completo):
+def inserir_evento(cursor, event_name: str, pix_id: str, headers_json: dict, json_completo: dict):
     """
-    Salva/atualiza em pix_recebidos somente quando for PAID.
-    E já tenta vincular à cobrança gerada.
-    pago SEMPRE 0.
+    Salva SEMPRE qualquer webhook recebido (auditoria).
     """
-    pix_id = str(obj.get("id") or "").strip()
-    if not pix_id:
-        return False, "pix_id vazio"
-
-    surrogate_key = obj.get("surrogateKey") or obj.get("surrogate_key")
-    status = obj.get("status")
-    amount = obj.get("amount")
-    payer_cpf_cnpj = obj.get("payerCpfCnpj")
-    payer_name = obj.get("payerName")
-    emv = obj.get("emv")
-
-    payment_date = parse_iso_to_mysql_dt(obj.get("paymentDate"))
-    created_at_api = parse_iso_to_mysql_dt(obj.get("createdAt"))
-
-    vinc = fetch_cobranca_vinculo(cursor, pix_id) or {}
-    id_cobrancas = vinc.get("id_cobrancas")
-    codigoparasistema = vinc.get("codigoparasistema")
-    codcadastro = vinc.get("codcadastro")
-
-    cursor.execute("""
-        INSERT INTO develop_1_lic.pix_recebidos
-        (
-          pix_id, surrogate_key, status, amount,
-          payment_date, payer_cpf_cnpj, payer_name, emv, created_at_api,
-          codigoparasistema, codcadastro, id_cobrancas,
-          pago, json_completo
-        )
+    cursor.execute(
+        f"""
+        INSERT INTO {TBL_EVENTOS}
+          (event_name, pix_id, headers_json, json_completo, received_at)
         VALUES
-        (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s)
-        ON DUPLICATE KEY UPDATE
-          surrogate_key = VALUES(surrogate_key),
-          status = VALUES(status),
-          amount = VALUES(amount),
-          payment_date = VALUES(payment_date),
-          payer_cpf_cnpj = VALUES(payer_cpf_cnpj),
-          payer_name = VALUES(payer_name),
-          emv = VALUES(emv),
-          created_at_api = VALUES(created_at_api),
-          codigoparasistema = COALESCE(VALUES(codigoparasistema), codigoparasistema),
-          codcadastro = COALESCE(VALUES(codcadastro), codcadastro),
-          id_cobrancas = COALESCE(VALUES(id_cobrancas), id_cobrancas),
-          -- pago fica 0 sempre, então não atualiza pra 1 aqui
-          json_completo = VALUES(json_completo)
-    """, (
-        pix_id,
-        surrogate_key,
-        status,
-        amount,
-        payment_date,
-        payer_cpf_cnpj,
-        payer_name,
-        emv,
-        created_at_api,
-        codigoparasistema,
-        codcadastro,
-        id_cobrancas,
-        json_completo
-    ))
-    return True, {"pix_id": pix_id, "id_cobrancas": id_cobrancas, "codigoparasistema": codigoparasistema, "codcadastro": codcadastro}
+          (%s, %s, %s, %s, %s)
+        """,
+        (
+            str(event_name or ""),
+            str(pix_id or ""),
+            safe_json(headers_json),
+            safe_json(json_completo),
+            now_utc_str(),
+        ),
+    )
+
+
+def upsert_pix_recebido(cursor, pix: dict, vinculo: dict):
+    """
+    Insere na pix_recebidos somente para eventos de pagamento.
+    Se já existir pix_id, atualiza os campos principais.
+    """
+    pix_id = str(pix.get("id") or "")
+    surrogate = str(pix.get("surrogateKey") or "")
+    status = str(pix.get("status") or "")
+    amount = pix.get("amount", None)
+    payment_date = pix.get("paymentDate", None)
+    payer_doc = str(pix.get("payerCpfCnpj") or "")
+    payer_name = str(pix.get("payerName") or "")
+    emv = str(pix.get("emv") or "")
+    created_at = pix.get("createdAt", None)
+
+    # Seus vínculos
+    codigoparasistema = vinculo.get("codigoparasistema")
+    codcadastro = vinculo.get("codcadastro")
+    id_cobrancas = vinculo.get("id_cobrancas")
+
+    # Idempotência por pix_id
+    cursor.execute(
+        f"""
+        SELECT id
+        FROM {TBL_RECEBIDOS}
+        WHERE pix_id = %s
+        LIMIT 1
+        """,
+        (pix_id,),
+    )
+    exists = cursor.fetchone()
+
+    if exists:
+        cursor.execute(
+            f"""
+            UPDATE {TBL_RECEBIDOS}
+            SET
+              surrogate_key = %s,
+              status = %s,
+              amount = %s,
+              payment_date = %s,
+              payer_cpf_cnpj = %s,
+              payer_name = %s,
+              emv = %s,
+              created_at = %s,
+              recebido_em = %s,
+              json_completo = %s,
+              codigoparasistema = COALESCE(%s, codigoparasistema),
+              codcadastro = COALESCE(%s, codcadastro),
+              id_cobrancas = COALESCE(%s, id_cobrancas)
+            WHERE pix_id = %s
+            """,
+            (
+                surrogate,
+                status,
+                amount,
+                payment_date,
+                payer_doc,
+                payer_name,
+                emv,
+                created_at,
+                now_utc_str(),
+                safe_json(pix),
+                codigoparasistema,
+                codcadastro,
+                id_cobrancas,
+                pix_id,
+            ),
+        )
+    else:
+        cursor.execute(
+            f"""
+            INSERT INTO {TBL_RECEBIDOS}
+              (pix_id, surrogate_key, status, amount, payment_date, payer_cpf_cnpj, payer_name, emv, created_at,
+               recebido_em, json_completo, codigoparasistema, codcadastro, id_cobrancas, pago)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+               %s, %s, %s, %s, %s, 0)
+            """,
+            (
+                pix_id,
+                surrogate,
+                status,
+                amount,
+                payment_date,
+                payer_doc,
+                payer_name,
+                emv,
+                created_at,
+                now_utc_str(),
+                safe_json(pix),
+                codigoparasistema,
+                codcadastro,
+                id_cobrancas,
+            ),
+        )
+
 
 @app.get("/")
-def health():
+def home():
     return jsonify({"service": "pix-recebidos", "status": "ok"}), 200
 
+
 @app.post("/webhook/pix-pago")
-def webhook_pix_pago():
-    # 1) valida auth do callback (seu segredo)
-    auth = request.headers.get("Authorization", "")
-    if auth != WEBHOOK_AUTH:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    # 2) lê payload
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({"ok": False, "error": "invalid_json"}), 400
-
-    # 3) prepara dados
-    ip_origem = request.headers.get("X-Forwarded-For", request.remote_addr)
-    headers_json = dict(request.headers)
-
-    # grava json completo do jeito que chegou
-    json_completo = json.dumps(payload, ensure_ascii=False)
-
-    event_name = pick_event_name(payload)
-    obj = normalize_payment_obj(payload) or {}
-
-    status = obj.get("status")
-    paid = is_paid_event(event_name, status)
-
-    conn = None
+def webhook_pix():
     try:
-        conn = conectar_banco()
-        with conn.cursor() as cursor:
-            # 4) LOG: sempre salva tudo
-            insert_log_event(cursor, event_name, obj, headers_json, json_completo, ip_origem)
+        # 1) valida header Authorization
+        auth = request.headers.get("Authorization", "")
+        if WEBHOOK_AUTH and auth != WEBHOOK_AUTH:
+            return jsonify({"error": "Unauthorized"}), 401
 
-            # 5) CONSOLIDADO: só se for pagamento confirmado
-            paid_info = None
-            if paid:
-                ok_paid, paid_info = upsert_pix_recebido_paid(cursor, obj, json_completo)
-                if not ok_paid:
-                    # Mesmo se falhar no consolidado, o log já foi salvo
-                    pass
+        # 2) pega JSON
+        payload = request.get_json(silent=True) or {}
+        event_name = payload.get("event") or payload.get("type") or ""
+        pix_id = payload.get("id") or payload.get("pix_id") or ""
 
-        conn.commit()
+        if not pix_id:
+            return jsonify({"error": "pix_id ausente no payload"}), 400
 
-        return jsonify({
-            "ok": True,
-            "saved_log": True,
-            "saved_paid": bool(paid),
-            "event": event_name,
-            "status": status,
-        }), 200
+        headers_dict = {k: v for k, v in request.headers.items()}
+
+        conn = db_conn()
+        try:
+            with conn.cursor() as cursor:
+                # 3) salva evento SEMPRE
+                inserir_evento(cursor, event_name, pix_id, headers_dict, payload)
+
+                # 4) se for evento que indica pagamento, consulta dados completos e salva em pix_recebidos
+                # TecnoSpeed: pagamento concluído costuma chegar como PIX_SUCCESSFUL
+                if str(event_name).upper() in ("PIX_SUCCESSFUL", "PIX_PAID"):
+                    pix_full = tecnospeed_consultar_pix(pix_id)
+
+                    # se a consulta ainda não trouxe dados (raro, mas pode acontecer), não quebra
+                    if pix_full:
+                        vinculo = buscar_vinculo_cobranca(cursor, pix_id)
+                        upsert_pix_recebido(cursor, pix_full, vinculo)
+
+                conn.commit()
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        return jsonify({"ok": True}), 200
 
     except Exception as e:
-        if conn:
-            conn.rollback()
+        # Se der erro, você vai ver no log do Railway
+        print("ERRO WEBHOOK:", repr(e))
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+@app.get("/ui")
+def ui():
+    """
+    UI simples no Railway para acompanhar.
+    /ui?pix_id=...
+    """
+    pix_id = request.args.get("pix_id", "").strip()
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cursor:
+            if pix_id:
+                cursor.execute(
+                    f"SELECT * FROM {TBL_EVENTOS} WHERE pix_id=%s ORDER BY id_evento DESC LIMIT 30",
+                    (pix_id,),
+                )
+                eventos = cursor.fetchall()
+
+                cursor.execute(
+                    f"SELECT * FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1",
+                    (pix_id,),
+                )
+                recebido = cursor.fetchone()
+            else:
+                cursor.execute(
+                    f"SELECT * FROM {TBL_EVENTOS} ORDER BY id_evento DESC LIMIT 30"
+                )
+                eventos = cursor.fetchall()
+
+                cursor.execute(
+                    f"SELECT * FROM {TBL_RECEBIDOS} ORDER BY id DESC LIMIT 30"
+                )
+                recebido = cursor.fetchall()
+
+        html = f"""
+        <html>
+          <head><meta charset="utf-8"><title>PIX Monitor</title></head>
+          <body style="font-family: Arial; margin: 20px;">
+            <h2>PIX Monitor (Railway)</h2>
+
+            <form method="get" action="/ui" style="margin-bottom: 14px;">
+              <label>Buscar por PIX ID:</label>
+              <input name="pix_id" value="{pix_id}" style="width:420px;padding:6px;" />
+              <button type="submit" style="padding:6px 10px;">Buscar</button>
+              <a href="/ui" style="margin-left:10px;">Limpar</a>
+            </form>
+
+            <h3>Últimos Eventos (pix_webhook_eventos)</h3>
+            <pre style="background:#f6f6f6;padding:10px;border-radius:8px;overflow:auto;max-height:360px;">
+{json.dumps(eventos, ensure_ascii=False, indent=2)}
+            </pre>
+
+            <h3>Recebidos (pix_recebidos)</h3>
+            <pre style="background:#f6f6f6;padding:10px;border-radius:8px;overflow:auto;max-height:360px;">
+{json.dumps(recebido, ensure_ascii=False, indent=2)}
+            </pre>
+
+            <p><b>Dica:</b> se aparecer PIX_SUCCESSFUL aqui mas não tiver pix_recebidos vinculado,
+            provavelmente a cobrança ainda não estava salva em pix_cobrancas_geradas no momento do webhook.</p>
+          </body>
+        </html>
+        """
+        return Response(html, mimetype="text/html")
+
     finally:
-        if conn:
+        try:
             conn.close()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
+    # Railway usa PORT automaticamente
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
