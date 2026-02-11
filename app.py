@@ -3,7 +3,7 @@ import json
 import base64
 import pymysql
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
@@ -19,7 +19,7 @@ DB_NAME = os.getenv("DB_NAME", "develop_1_lic")
 
 TECNOSPEED_BASE = os.getenv("TECNOSPEED_BASE", "https://pix.tecnospeed.com.br")
 
-# EXATAMENTE o header que você cadastrou no webhook da TecnoSpeed
+# EXATAMENTE o que você cadastrou na TecnoSpeed
 WEBHOOK_AUTH = os.getenv("WEBHOOK_AUTH", "Basic dev854850")
 
 # Tabelas (nomes fixos)
@@ -30,7 +30,7 @@ TBL_EVENTOS = f"{DB_NAME}.pix_webhook_eventos"
 
 
 # =========================
-# Helpers
+# DB Helpers
 # =========================
 def db_conn():
     return pymysql.connect(
@@ -57,9 +57,6 @@ def safe_json(obj):
 
 
 def parse_iso_dt(s: str):
-    """
-    Converte '2021-08-25T00:19:23.248Z' -> 'YYYY-MM-DD HH:MM:SS' (UTC)
-    """
     if not s:
         return None
     try:
@@ -71,9 +68,12 @@ def parse_iso_dt(s: str):
 
 
 # =========================
-# Vínculo (pix_cobrancas_geradas)
+# Vinculo: pix_cobrancas_geradas
 # =========================
 def buscar_vinculo_por_pix(cursor, pix_id: str) -> dict:
+    """
+    Ajustado para o seu schema real: id_cobrancas, codigoparasistema, codcadastro
+    """
     cursor.execute(
         f"""
         SELECT
@@ -91,7 +91,7 @@ def buscar_vinculo_por_pix(cursor, pix_id: str) -> dict:
 
 
 # =========================
-# dadospix -> token_company
+# dadospix + token_company
 # =========================
 def buscar_dadospix(cursor, codigoparasistema, codcadastro) -> dict:
     cursor.execute(
@@ -117,32 +117,27 @@ def buscar_dadospix(cursor, codigoparasistema, codcadastro) -> dict:
 
 def token_expirado(expires_at) -> bool:
     """
-    Considera expirado se faltam < 120s
+    considera expirado se faltar < 120s
     """
     if not expires_at:
         return True
     try:
-        dt = expires_at
-        if isinstance(dt, str):
-            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return (dt - now).total_seconds() < 120
+        if isinstance(expires_at, str):
+            # MySQL DATETIME -> "YYYY-MM-DD HH:MM:SS"
+            dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        else:
+            dt = expires_at
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime.now(timezone.utc)).total_seconds() < 120
     except Exception:
         return True
 
 
 def renovar_token_company(client_id: str, client_secret: str) -> dict:
     """
-    POST /oauth2/token
-    Headers:
-      Authorization: Basic base64(client_id:client_secret)
-      Content-Type: application/x-www-form-urlencoded
-
-    Body (OBRIGATÓRIO para TecnoSpeed):
-      grant_type=client_credentials
-      role=company
+    POST https://pix.tecnospeed.com.br/oauth2/token
+    body: grant_type=client_credentials & role=company
     """
     if not client_id or not client_secret:
         raise RuntimeError("client_id/client_secret ausentes no dadospix")
@@ -158,24 +153,23 @@ def renovar_token_company(client_id: str, client_secret: str) -> dict:
         "Accept": "application/json",
     }
 
-    # ✅ FIX: TecnoSpeed exige role
     data = {
         "grant_type": "client_credentials",
-        "role": "company",
+        "role": "company",   # <<< AQUI o ajuste que faltava (evita 422)
     }
 
-    r = requests.post(url, headers=headers, data=data, timeout=20)
+    r = requests.post(url, headers=headers, data=data, timeout=25)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Falha ao renovar token ({r.status_code}): {r.text}")
 
     j = r.json() or {}
     access_token = j.get("access_token")
     expires_in = int(j.get("expires_in") or 3600)
+
     if not access_token:
         raise RuntimeError(f"Resposta sem access_token: {r.text}")
 
-    expires_at_utc = datetime.now(timezone.utc).timestamp() + expires_in
-    expires_dt = datetime.fromtimestamp(expires_at_utc, tz=timezone.utc).replace(tzinfo=None)
+    expires_dt = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).replace(tzinfo=None)
 
     return {
         "access_token": access_token,
@@ -195,7 +189,7 @@ def garantir_token_company(cursor, codigoparasistema, codcadastro) -> str:
     client_secret = (dp.get("tecnospeed_client_secret") or "").strip()
     iddadospix = dp.get("iddadospix")
 
-    if (not token) or token_expirado(expires_at):
+    if not token or token_expirado(expires_at):
         novo = renovar_token_company(client_id, client_secret)
         token = novo["access_token"]
 
@@ -213,30 +207,57 @@ def garantir_token_company(cursor, codigoparasistema, codcadastro) -> str:
 
 
 # =========================
-# TecnoSpeed: consultar pix/query
+# TecnoSpeed: Consultar PIX
 # =========================
 def tecnospeed_consultar_pix(pix_id: str, token_company: str) -> dict:
+    """
+    A API pode exigir date/range. Vamos:
+    1) tentar por id direto
+    2) se der 400 pedindo date/range -> tenta range últimos 30 dias + id
+    """
     url = f"{TECNOSPEED_BASE}/api/v1/pix/query"
     headers = {"Authorization": f"Bearer {token_company}", "Accept": "application/json"}
-    params = {"id": pix_id}
 
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"Consulta PIX falhou ({r.status_code}): {r.text}")
+    # tentativa 1: só id
+    r1 = requests.get(url, headers=headers, params={"id": pix_id}, timeout=25)
+    if r1.status_code == 200:
+        data = r1.json()
+        if isinstance(data, list):
+            return data[0] if data else {}
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            return data["results"][0] if data["results"] else {}
+        return {}
 
-    data = r.json()
+    # fallback: se reclamar de date/range
+    msg = (r1.text or "")
+    if r1.status_code == 400 and ("Date or range of dates" in msg or "betweenDateStart" in msg or "date" in msg):
+        end = datetime.now().date()
+        start = end - timedelta(days=30)
 
-    if isinstance(data, list):
-        return data[0] if data else {}
+        params = {
+            "betweenDateStart": start.strftime("%Y-%m-%d"),
+            "betweenDateEnd": end.strftime("%Y-%m-%d"),
+            "queryType": "PAYMENT",   # geralmente o que faz sentido ao confirmar pagamento
+            "id": pix_id,
+            "limit": 1,
+        }
+        r2 = requests.get(url, headers=headers, params=params, timeout=25)
+        if r2.status_code != 200:
+            raise RuntimeError(f"Consulta PIX falhou ({r2.status_code}): {r2.text}")
 
-    if isinstance(data, dict) and isinstance(data.get("results"), list):
-        return data["results"][0] if data["results"] else {}
+        data = r2.json()
+        if isinstance(data, list):
+            return data[0] if data else {}
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            return data["results"][0] if data["results"] else {}
+        return {}
 
-    return {}
+    # qualquer outro erro
+    raise RuntimeError(f"Consulta PIX falhou ({r1.status_code}): {r1.text}")
 
 
 # =========================
-# Inserts / Upserts
+# Inserts
 # =========================
 def inserir_evento(cursor, event_name: str, pix_id: str, headers_json: dict, json_completo: dict):
     cursor.execute(
@@ -256,7 +277,46 @@ def inserir_evento(cursor, event_name: str, pix_id: str, headers_json: dict, jso
     )
 
 
-def upsert_pix_recebido(cursor, pix: dict, vinculo: dict):
+def upsert_pix_recebido_minimo(cursor, pix_id: str, event_name: str, vinculo: dict, payload: dict):
+    """
+    Se não conseguir consultar a TecnoSpeed no momento, grava pelo menos o pix_id + status.
+    Depois, quando consultar, ele atualiza.
+    """
+    cursor.execute(f"SELECT id_recebido FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1", (pix_id,))
+    exists = cursor.fetchone()
+
+    codigoparasistema = vinculo.get("codigoparasistema")
+    codcadastro = vinculo.get("codcadastro")
+    id_cobrancas = vinculo.get("id_cobrancas")
+
+    if exists:
+        cursor.execute(
+            f"""
+            UPDATE {TBL_RECEBIDOS}
+            SET
+              status=%s,
+              recebido_em=%s,
+              json_completo=%s,
+              codigoparasistema=COALESCE(%s, codigoparasistema),
+              codcadastro=COALESCE(%s, codcadastro),
+              id_cobrancas=COALESCE(%s, id_cobrancas)
+            WHERE pix_id=%s
+            """,
+            (str(event_name or ""), now_str(), safe_json(payload), codigoparasistema, codcadastro, id_cobrancas, pix_id),
+        )
+    else:
+        cursor.execute(
+            f"""
+            INSERT INTO {TBL_RECEBIDOS}
+              (pix_id, status, recebido_em, json_completo, codigoparasistema, codcadastro, id_cobrancas, pago)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, %s, 0)
+            """,
+            (pix_id, str(event_name or ""), now_str(), safe_json(payload), codigoparasistema, codcadastro, id_cobrancas),
+        )
+
+
+def upsert_pix_recebido_completo(cursor, pix: dict, vinculo: dict):
     pix_id = str(pix.get("id") or "")
     surrogate = str(pix.get("surrogateKey") or "")
     status = str(pix.get("status") or "")
@@ -271,10 +331,7 @@ def upsert_pix_recebido(cursor, pix: dict, vinculo: dict):
     codcadastro = vinculo.get("codcadastro")
     id_cobrancas = vinculo.get("id_cobrancas")
 
-    cursor.execute(
-        f"SELECT id_recebido FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1",
-        (pix_id,),
-    )
+    cursor.execute(f"SELECT id_recebido FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1", (pix_id,))
     exists = cursor.fetchone()
 
     if exists:
@@ -298,19 +355,10 @@ def upsert_pix_recebido(cursor, pix: dict, vinculo: dict):
             WHERE pix_id=%s
             """,
             (
-                surrogate,
-                status,
-                amount,
-                payment_date,
-                payer_doc,
-                payer_name,
-                emv,
-                created_at,
-                now_str(),
-                safe_json(pix),
-                codigoparasistema,
-                codcadastro,
-                id_cobrancas,
+                surrogate, status, amount, payment_date,
+                payer_doc, payer_name, emv, created_at,
+                now_str(), safe_json(pix),
+                codigoparasistema, codcadastro, id_cobrancas,
                 pix_id,
             ),
         )
@@ -325,20 +373,8 @@ def upsert_pix_recebido(cursor, pix: dict, vinculo: dict):
                %s,%s,%s,%s,%s,0)
             """,
             (
-                pix_id,
-                surrogate,
-                status,
-                amount,
-                payment_date,
-                payer_doc,
-                payer_name,
-                emv,
-                created_at,
-                now_str(),
-                safe_json(pix),
-                codigoparasistema,
-                codcadastro,
-                id_cobrancas,
+                pix_id, surrogate, status, amount, payment_date, payer_doc, payer_name, emv, created_at,
+                now_str(), safe_json(pix), codigoparasistema, codcadastro, id_cobrancas
             ),
         )
 
@@ -353,6 +389,11 @@ def home():
 
 @app.post("/webhook/pix-pago")
 def webhook_pix():
+    """
+    Recebe QUALQUER evento TecnoSpeed.
+    - sempre salva em pix_webhook_eventos
+    - se evento for "pago", tenta consultar detalhes e salvar em pix_recebidos
+    """
     try:
         auth = request.headers.get("Authorization", "")
         if WEBHOOK_AUTH and auth != WEBHOOK_AUTH:
@@ -363,40 +404,38 @@ def webhook_pix():
         pix_id = (payload.get("id") or payload.get("pix_id") or "").strip()
 
         if not pix_id:
-            return jsonify({"error": "pix_id ausente no payload"}), 400
+            return jsonify({"error": "id (pix_id) ausente no payload"}), 400
 
         headers_dict = {k: v for k, v in request.headers.items()}
 
         conn = db_conn()
         try:
             with conn.cursor() as cursor:
-                # 1) salva SEMPRE
+                # 1) auditoria sempre
                 inserir_evento(cursor, event_name, pix_id, headers_dict, payload)
 
-                # 2) pagamento confirmado -> consulta e salva completo
                 ev = event_name.upper()
                 if ev in ("PIX_SUCCESSFUL", "PIX_PAID"):
                     vinculo = buscar_vinculo_por_pix(cursor, pix_id)
 
-                    if not vinculo.get("id_cobrancas"):
-                        print(f"[WARN] PIX pago sem vínculo em pix_cobrancas_geradas. pix_id={pix_id}")
-                        conn.commit()
-                        return jsonify({"ok": True, "warn": "sem_vinculo"}), 200
+                    # garante que pelo menos o "pago" fique rastreável em pix_recebidos
+                    upsert_pix_recebido_minimo(cursor, pix_id, ev, vinculo, payload)
 
-                    token_company = garantir_token_company(
-                        cursor,
-                        vinculo.get("codigoparasistema"),
-                        vinculo.get("codcadastro"),
-                    )
-
-                    pix_full = tecnospeed_consultar_pix(pix_id, token_company)
-                    if pix_full:
-                        upsert_pix_recebido(cursor, pix_full, vinculo)
-                    else:
-                        print(f"[WARN] pix/query vazio. pix_id={pix_id}")
+                    # tenta consultar o PIX completo
+                    try:
+                        token_company = garantir_token_company(
+                            cursor,
+                            vinculo.get("codigoparasistema"),
+                            vinculo.get("codcadastro"),
+                        )
+                        pix_full = tecnospeed_consultar_pix(pix_id, token_company)
+                        if pix_full:
+                            upsert_pix_recebido_completo(cursor, pix_full, vinculo)
+                    except Exception as e:
+                        # não derruba, só loga
+                        print(f"[WARN] Falha ao consultar PIX completo (pix_id={pix_id}): {repr(e)}")
 
                 conn.commit()
-
         finally:
             try:
                 conn.close()
@@ -412,6 +451,11 @@ def webhook_pix():
 
 @app.get("/ui")
 def ui():
+    """
+    UI simples:
+    - /ui            -> últimos eventos + últimos recebidos
+    - /ui?pix_id=... -> filtra por pix_id
+    """
     pix_id = request.args.get("pix_id", "").strip()
 
     conn = db_conn()
@@ -433,16 +477,17 @@ def ui():
                 cursor.execute(f"SELECT * FROM {TBL_EVENTOS} ORDER BY id_evento DESC LIMIT 80")
                 eventos = cursor.fetchall()
 
-                cursor.execute(f"SELECT * FROM {TBL_RECEBIDOS} ORDER BY id_recebido DESC LIMIT 50")
+                cursor.execute(f"SELECT * FROM {TBL_RECEBIDOS} ORDER BY id_recebido DESC LIMIT 80")
                 recebidos = cursor.fetchall()
 
         html = f"""
         <html>
           <head><meta charset="utf-8"><title>PIX Monitor</title></head>
-          <body style="font-family:Arial;margin:20px;">
-            <h2>PIX Monitor</h2>
-            <form method="get" action="/ui" style="margin-bottom:14px;">
-              <label>PIX ID:</label>
+          <body style="font-family: Arial; margin: 20px;">
+            <h2>PIX Monitor (Railway)</h2>
+
+            <form method="get" action="/ui" style="margin-bottom: 14px;">
+              <label>Buscar por PIX ID:</label>
               <input name="pix_id" value="{pix_id}" style="width:520px;padding:6px;" />
               <button type="submit" style="padding:6px 10px;">Buscar</button>
               <a href="/ui" style="margin-left:10px;">Limpar</a>
@@ -453,6 +498,10 @@ def ui():
 
             <h3>Recebidos (pix_recebidos)</h3>
             <pre style="background:#f6f6f6;padding:10px;border-radius:8px;overflow:auto;max-height:360px;">{json.dumps(recebidos, ensure_ascii=False, indent=2)}</pre>
+
+            <p><b>Obs:</b> Se vier PIX_SUCCESSFUL e não vier completo (payerName/amount/etc),
+            você ainda vai ter a linha mínima em pix_recebidos. Depois, quando o token estiver ok e a consulta bater,
+            ela atualiza com os dados completos.</p>
           </body>
         </html>
         """
