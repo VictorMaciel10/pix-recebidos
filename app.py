@@ -8,6 +8,13 @@ import pymysql
 import requests
 from flask import Flask, request, jsonify, Response
 
+# timezone BR
+try:
+    from zoneinfo import ZoneInfo
+    TZ_BR = ZoneInfo("America/Sao_Paulo")
+except Exception:
+    TZ_BR = timezone(timedelta(hours=-3))
+
 app = Flask(__name__)
 
 # =========================
@@ -19,10 +26,10 @@ DB_USER = os.getenv("DB_USER", "")
 DB_PASS = os.getenv("DB_PASS", "")
 DB_NAME = os.getenv("DB_NAME", "develop_1_lic")
 
-# TecnoSpeed (para consultar /api/v1/pix/{id})
+# TecnoSpeed (consulta /api/v1/pix/{id})
 TECNOSPEED_BASE = os.getenv("TECNOSPEED_BASE", "https://pix.tecnospeed.com.br")
 
-# Webhook auth (EXATAMENTE igual cadastrado na TecnoSpeed; se vazio, não valida)
+# Webhook auth (se vazio, não valida)
 WEBHOOK_AUTH = os.getenv("WEBHOOK_AUTH", "")
 
 # PlugzAPI (WhatsApp)
@@ -33,7 +40,7 @@ PLUGZ_API_URL = os.getenv(
 PLUGZ_CLIENT_TOKEN = os.getenv("PLUGZ_CLIENT_TOKEN", "Fc0dd5429e2674e2e9cea2c0b5b29d000S")
 
 # =========================
-# Tabelas (nomes fixos)
+# Tabelas
 # =========================
 TBL_COBRANCAS = f"{DB_NAME}.pix_cobrancas_geradas"
 TBL_RECEBIDOS = f"{DB_NAME}.pix_recebidos"
@@ -53,11 +60,14 @@ def safe_json(obj):
 
 
 def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(TZ_BR).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_iso_dt(s):
-    """Converte ISO 8601 (com Z) para 'YYYY-MM-DD HH:MM:SS' (UTC, sem tz)."""
+def parse_iso_dt_to_br(s):
+    """
+    Converte ISO 8601 (ex.: 2026-02-11T16:37:03.112Z) para DATETIME local BR (-03:00)
+    Retorna 'YYYY-MM-DD HH:MM:SS' (sem tz) ou None.
+    """
     if not s:
         return None
     try:
@@ -65,7 +75,8 @@ def parse_iso_dt(s):
         dt = datetime.fromisoformat(s2)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        dt_br = dt.astimezone(TZ_BR).replace(tzinfo=None)
+        return dt_br.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
@@ -162,22 +173,18 @@ def token_expirado(expires_at) -> bool:
             dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
         else:
             dt = expires_at
+        # se vier sem tz, assume BR
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (dt - datetime.now(timezone.utc)).total_seconds() < 120
+            dt = dt.replace(tzinfo=TZ_BR)
+        return (dt - datetime.now(dt.tzinfo)).total_seconds() < 120
     except Exception:
         return True
 
 
 def renovar_token_company(client_id: str, client_secret: str) -> dict:
     """
-    POST https://pix.tecnospeed.com.br/oauth2/token
-    Headers:
-      Content-Type: application/x-www-form-urlencoded
-      Authorization: Basic base64(client_id:client_secret)
-    Body:
-      grant_type=client_credentials
-      role=company
+    POST /oauth2/token
+    Body: grant_type=client_credentials & role=company
     """
     url = f"{TECNOSPEED_BASE}/oauth2/token"
     raw = f"{client_id}:{client_secret}".encode("utf-8")
@@ -201,7 +208,7 @@ def renovar_token_company(client_id: str, client_secret: str) -> dict:
     if not access_token:
         raise RuntimeError(f"Resposta sem access_token: {r.text}")
 
-    expires_dt = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).replace(tzinfo=None)
+    expires_dt = (datetime.now(TZ_BR) + timedelta(seconds=expires_in)).replace(tzinfo=None)
 
     return {
         "access_token": access_token,
@@ -248,7 +255,6 @@ def tecnospeed_consultar_pix_por_id(pix_id: str, token_company: str) -> dict:
     r = requests.get(url, headers=headers, timeout=25)
     if r.status_code != 200:
         raise RuntimeError(f"Consulta PIX por ID falhou ({r.status_code}): {r.text}")
-
     data = r.json() or {}
     return data if isinstance(data, dict) else {}
 
@@ -268,48 +274,35 @@ def inserir_evento(cursor, event_name: str, pix_id: str, headers_json: dict, jso
     )
 
 
-def upsert_pix_recebido(cursor, pix_full: dict, vinculo: dict, pago: int):
+def upsert_pix_recebido(cursor, pix_full: dict, vinculo: dict):
     """
-    Preenche exatamente os campos que você listou na pix_recebidos:
-    id_recebido (auto)
-    pix_id
-    surrogate_key
-    status
-    amount
-    payment_date
-    payer_cpf_cnpj
-    payer_name
-    emv
-    created_at_api
-    recebido_em
-    codigoparasistema
-    codcadastro
-    id_cobrancas
-    pago
-    json_completo
+    Regras:
+    - Sempre INSERE com pago=0
+    - Em UPDATE: NÃO ALTERA o campo pago (outro robô cuida disso)
+    Retorna: previous_payment_date (pra decidir envio de WhatsApp sem duplicar)
     """
     pix_id = str(pix_full.get("id") or "")
     surrogate = str(pix_full.get("surrogateKey") or "")
     status = str(pix_full.get("status") or "")
     amount = pix_full.get("amount")
-    payment_date = parse_iso_dt(pix_full.get("paymentDate"))
+    payment_date = parse_iso_dt_to_br(pix_full.get("paymentDate"))
     payer_doc = str(pix_full.get("payerCpfCnpj") or "")
     payer_name = str(pix_full.get("payerName") or "")
     emv = str(pix_full.get("emv") or "")
-    created_at_api = parse_iso_dt(pix_full.get("createdAt"))
+    created_at_api = parse_iso_dt_to_br(pix_full.get("createdAt"))
 
     codigoparasistema = vinculo.get("codigoparasistema")
     codcadastro = vinculo.get("codcadastro")
     id_cobrancas = vinculo.get("id_cobrancas")
 
     cursor.execute(
-        f"SELECT id_recebido, pago FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1",
+        f"SELECT id_recebido, payment_date FROM {TBL_RECEBIDOS} WHERE pix_id=%s LIMIT 1",
         (pix_id,),
     )
     exists = cursor.fetchone()
+    prev_payment_date = (exists.get("payment_date") if exists else None)
 
     if exists:
-        prev_pago = int(exists.get("pago") or 0)
         cursor.execute(
             f"""
             UPDATE {TBL_RECEBIDOS}
@@ -326,16 +319,14 @@ def upsert_pix_recebido(cursor, pix_full: dict, vinculo: dict, pago: int):
               codigoparasistema=%s,
               codcadastro=%s,
               id_cobrancas=%s,
-              pago=%s,
               json_completo=%s
             WHERE pix_id=%s
             """,
             (
                 surrogate, status, amount, payment_date, payer_doc, payer_name, emv, created_at_api,
-                now_str(), codigoparasistema, codcadastro, id_cobrancas, int(pago), safe_json(pix_full), pix_id
+                now_str(), codigoparasistema, codcadastro, id_cobrancas, safe_json(pix_full), pix_id
             ),
         )
-        return {"already_exists": True, "previous_pago": prev_pago}
     else:
         cursor.execute(
             f"""
@@ -344,18 +335,19 @@ def upsert_pix_recebido(cursor, pix_full: dict, vinculo: dict, pago: int):
                created_at_api, recebido_em, codigoparasistema, codcadastro, id_cobrancas, pago, json_completo)
             VALUES
               (%s,%s,%s,%s,%s,%s,%s,%s,
-               %s,%s,%s,%s,%s,%s,%s)
+               %s,%s,%s,%s,%s,0,%s)
             """,
             (
                 pix_id, surrogate, status, amount, payment_date, payer_doc, payer_name, emv,
-                created_at_api, now_str(), codigoparasistema, codcadastro, id_cobrancas, int(pago), safe_json(pix_full)
+                created_at_api, now_str(), codigoparasistema, codcadastro, id_cobrancas, safe_json(pix_full)
             ),
         )
-        return {"already_exists": False, "previous_pago": 0}
+
+    return {"previous_payment_date": prev_payment_date, "payment_date": payment_date}
 
 
 # =========================
-# WhatsApp (PlugzAPI)
+# WhatsApp
 # =========================
 def format_br_phone(ddd, fone):
     d = digits(ddd)
@@ -478,19 +470,14 @@ def home():
 @app.post("/webhook/pix-pago")
 def webhook_pix():
     """
-    Fluxo:
     - Recebe PIX_SUCCESSFUL {event,id}
     - Salva SEMPRE em pix_webhook_eventos
     - Consulta GET /api/v1/pix/{id}
-    - Se status == LIQUIDATED:
-        - upsert pix_recebidos com pago=1
-        - envia WhatsApp 1 vez (idempotência por pago)
-    - Se não:
-        - upsert pix_recebidos com pago=0 (opcional, mas bom pra monitorar)
-        - não envia WhatsApp
+    - Se status == LIQUIDATED e paymentDate existe:
+        - upsert pix_recebidos (sem tocar em pago; insert pago=0)
+        - envia WhatsApp APENAS se antes payment_date era NULL e agora não é
     """
     try:
-        # 0) valida Authorization (se configurado)
         auth = request.headers.get("Authorization", "")
         if WEBHOOK_AUTH and auth != WEBHOOK_AUTH:
             return jsonify({"error": "Unauthorized"}), 401
@@ -510,10 +497,8 @@ def webhook_pix():
         conn = db_conn()
         try:
             with conn.cursor() as cursor:
-                # 1) auditoria SEMPRE
                 inserir_evento(cursor, event_name, pix_id, headers_dict, payload)
 
-                # 2) só reage nesse evento
                 if event_name.upper() == "PIX_SUCCESSFUL":
                     vinculo = buscar_vinculo_por_pix(cursor, pix_id)
                     if not vinculo.get("codigoparasistema"):
@@ -521,27 +506,28 @@ def webhook_pix():
                         conn.commit()
                         return jsonify({"ok": True, "warn": "Sem vínculo"}), 200
 
-                    # 3) token company (dadospix)
                     token_company = garantir_token_company(
                         cursor,
                         vinculo.get("codigoparasistema"),
                         vinculo.get("codcadastro"),
                     )
 
-                    # 4) consulta PIX completo por ID
                     pix_full = tecnospeed_consultar_pix_por_id(pix_id, token_company)
 
                     print("[INFO] Retorno TecnoSpeed /api/v1/pix/{id}:")
                     print(json.dumps(pix_full, ensure_ascii=False))
 
                     status_pix = str(pix_full.get("status") or "").upper().strip()
-                    pago = 1 if status_pix == "LIQUIDATED" else 0
+                    payment_date_br = parse_iso_dt_to_br(pix_full.get("paymentDate"))
 
-                    # 5) upsert na pix_recebidos
-                    info = upsert_pix_recebido(cursor, pix_full, vinculo, pago=pago)
+                    # sempre salva/atualiza no recebidos (sem mexer no pago)
+                    info = upsert_pix_recebido(cursor, pix_full, vinculo)
 
-                    # 6) se pago, manda WhatsApp apenas 1 vez
-                    if pago == 1 and int(info.get("previous_pago") or 0) != 1:
+                    # manda WhatsApp apenas quando realmente liquidado e acabou de ganhar payment_date
+                    prev_pd = info.get("previous_payment_date")
+                    now_pd = info.get("payment_date")
+
+                    if status_pix == "LIQUIDATED" and now_pd and (not prev_pd):
                         schema = obter_schema_por_codigoempresa(cursor, vinculo.get("codigoparasistema"))
                         schema = (schema or "").strip().lower()
 
@@ -554,14 +540,13 @@ def webhook_pix():
                         nome_final = obter_nome_por_codcadastro(cursor, schema, cod_final)
 
                         valor = pix_full.get("amount")
-                        data_pag = parse_iso_dt(pix_full.get("paymentDate"))
 
                         msg = montar_mensagem(
                             nome_cliente_empresa=nome_empresa or "Cliente",
                             numero_pedido=str(pedidovendaid or ""),
                             nome_cliente_final=nome_final or "Cliente",
                             valor=valor,
-                            data_mysql=data_pag or "",
+                            data_mysql=payment_date_br or "",
                         )
 
                         if telefones:
@@ -569,9 +554,8 @@ def webhook_pix():
                                 enviar_whatsapp(fone, msg)
                         else:
                             print(f"[WARN] Nenhum telefone encontrado em {schema}.cadastro (codcadastro={vinculo.get('codcadastro')}).")
-
-                    elif pago == 0:
-                        print(f"[INFO] PIX ainda não está LIQUIDATED (pix_id={pix_id}). Não envia WhatsApp.")
+                    else:
+                        print(f"[INFO] Não envia WhatsApp (status={status_pix}, paymentDate={payment_date_br}, prev_payment_date={prev_pd}).")
 
                 conn.commit()
 
